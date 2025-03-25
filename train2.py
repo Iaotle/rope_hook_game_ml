@@ -85,7 +85,6 @@ print("Setting up training environment...")
 env = DummyVecEnv([lambda: make_env()])
 env = VecNormalize(env, norm_obs=True, norm_reward=True)
 
-
 # Check for GPU availability
 if torch.cuda.is_available():
     device = "cuda"
@@ -95,25 +94,60 @@ else:
     device = "cpu"
     print("No GPU detected, training on CPU")
 
-# Configure PPO model
-print("Initializing PPO model...")
-model = PPO(
-    "MlpPolicy",
-    env,
-    learning_rate=3e-4,
-    n_steps=2048,
-    batch_size=256,
-    n_epochs=10,
-    gamma=0.99,
-    gae_lambda=0.95,
-    clip_range=0.2,
-    ent_coef=0.05,
-    verbose=1,
-    tensorboard_log=log_dir,
-    device="cpu",
-    # separate networks for policy and value function
-    policy_kwargs={"net_arch": {"pi": [256, 256], "vf": [256, 256]}}
-)
+# Define important paths for saving/loading models and normalization statistics
+best_model_path = os.path.join(best_model_dir, "best_model")
+final_model_path = os.path.join(model_dir, f"final_model_{run_name}")
+interrupt_model_path = os.path.join(model_dir, f"interrupt_model_{run_name}")
+vecnorm_path = os.path.join(model_dir, f"vecnorm_{run_name}.pkl")
+
+# Check if a best model already exists and resume training if so
+if os.path.exists(f"{best_model_path}.zip"):
+    print("Resuming training from the best checkpoint...")
+    model = PPO.load(best_model_path, env=env, device=device)
+    # Load VecNormalize stats if available
+    if os.path.exists(vecnorm_path):
+        env = VecNormalize.load(vecnorm_path, env)
+        model.set_env(env)
+    # Update metadata to record that training is resumed
+    if hasattr(model, "metadata"):
+        model.metadata.update({
+            "run_name": run_name,
+            "timestamp": timestamp,
+            "resumed": True,
+            "last_resume": datetime.now().strftime("%Y%m%d_%H%M%S")
+        })
+    else:
+        model.metadata = {
+            "run_name": run_name,
+            "timestamp": timestamp,
+            "resumed": True,
+            "last_resume": datetime.now().strftime("%Y%m%d_%H%M%S")
+        }
+else:
+    # Create a new PPO model if no best checkpoint exists
+    print("Initializing new PPO model...")
+    model = PPO(
+        "MlpPolicy",
+        env,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=256,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        ent_coef=0.05,
+        verbose=1,
+        tensorboard_log=log_dir,
+        device=device,
+        # separate networks for policy and value function
+        policy_kwargs={"net_arch": {"pi": [256, 256], "vf": [256, 256]}}
+    )
+    model.metadata = {
+        "run_name": run_name,
+        "timestamp": timestamp,
+        "resumed": False
+    }
 
 # Setup evaluation environment
 eval_env = DummyVecEnv([lambda: make_env()])
@@ -196,6 +230,7 @@ class StopOnPlateauCallback(BaseCallback):
             return False
             
         return True
+
 # Add the plateau detection callback
 plateau_callback = StopOnPlateauCallback(
     eval_callback=eval_callback,
@@ -271,22 +306,13 @@ class BestModelVisualizationCallback(BaseCallback):
             
         return True
 
-# ...existing code...
-
 # Add the visualization callback
 viz_callback = BestModelVisualizationCallback(
     best_model_dir=best_model_dir,
-    eval_freq=10000,  # Show visualization every 10k steps
+    eval_freq=100000,  # Show visualization every 100k steps
     preview_steps=500,  # Show 500 steps in each visualization
     verbose=1
 )
-
-
-# Define important paths
-best_model_path = os.path.join(best_model_dir, "best_model")
-final_model_path = os.path.join(model_dir, f"final_model_{run_name}")
-interrupt_model_path = os.path.join(model_dir, f"interrupt_model_{run_name}")
-vecnorm_path = os.path.join(model_dir, f"vecnorm_{run_name}.pkl")
 
 # Training loop
 print(f"Starting training with PPO on {device}...")
@@ -300,20 +326,26 @@ start_time = time.time()
 try:
     model.learn(
         total_timesteps=total_timesteps,
-        callback=[eval_callback, plateau_callback, viz_callback], # checkpoint_callback
+        callback=[eval_callback, plateau_callback, viz_callback],  # checkpoint_callback can be added if desired
         tb_log_name=run_name,
         progress_bar=True
     )
-    # Save the final model
+    # Save the final model and normalization stats
     model.save(final_model_path)
     env.save(vecnorm_path)
     print(f"\nTraining completed in {time.time() - start_time:.2f} seconds")
     print(f"Final model saved to {final_model_path}")
     model_to_load = final_model_path
-    
+
 except KeyboardInterrupt:
     # Handle manual interruption
     print(f"\nTraining interrupted after {time.time() - start_time:.2f} seconds")
+    # Update metadata to indicate interruption
+    if hasattr(model, "metadata"):
+        model.metadata["interrupted"] = True
+        model.metadata["interrupt_time"] = datetime.now().strftime("%Y%m%d_%H%M%S")
+    else:
+        model.metadata = {"interrupted": True, "interrupt_time": datetime.now().strftime("%Y%m%d_%H%M%S")}
     model.save(interrupt_model_path)
     env.save(vecnorm_path)
     print(f"Interrupted model saved to {interrupt_model_path}")
