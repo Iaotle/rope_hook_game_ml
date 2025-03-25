@@ -174,7 +174,7 @@ class RopeEnv(gym.Env):
 
         # Define action and observation space
         # Action: 2D continuous change in anchor position (dx, dy)
-        self.action_space = spaces.Box(low=-100.0, high=100.0, shape=(2,), dtype=np.float32)
+        self.action_space = spaces.Box(low=-50.0, high=50.0, shape=(2,), dtype=np.float32)
         
         # Enhanced observation space:
         # [anchor_x, anchor_y,                     # Anchor position (2)
@@ -315,10 +315,12 @@ class RopeEnv(gym.Env):
 
         # Reward calculation:
         # +1 for each enemy hit
-        # Small time penalty to encourage efficiency
-        # Game over penalty
-        reward = 1.0 * len(enemies_to_remove) - 0.001  # Small time penalty
+        reward = 1.0 * len(enemies_to_remove)
+
+        # penalize effort
+        reward -= np.abs(action).sum() * 0.01
         
+        # Game over penalty
         if self.game_over:
             reward -= 10.0
         
