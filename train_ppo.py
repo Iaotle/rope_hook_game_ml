@@ -62,7 +62,7 @@ class SimpleGymnasiumEnv(gym.Env):
 
 # Create directories for logs and models
 log_dir = "logs"
-model_dir = "models"
+model_dir = "models/ppo"
 best_model_dir = os.path.join(model_dir, "best")
 os.makedirs(log_dir, exist_ok=True)
 os.makedirs(model_dir, exist_ok=True)
@@ -82,9 +82,10 @@ def make_env(render=False):
 
 # Create vectorized environment for training (no rendering)
 print("Setting up training environment...")
-env = DummyVecEnv([lambda: make_env()])
+from stable_baselines3.common.env_util import make_vec_env
+env = make_vec_env(make_env, n_envs=16)
 env = VecNormalize(env, norm_obs=True, norm_reward=True)
-
+# to force GPU off, add env variable CUDA_VISIBLE_DEVICES=-1 
 # Check for GPU availability
 if torch.cuda.is_available():
     device = "cuda"
@@ -160,7 +161,7 @@ checkpoint_callback = CheckpointCallback(
     save_freq=10000,
     save_path=model_dir,
     name_prefix=run_name,
-    verbose=0
+    verbose=1
 )
 
 eval_callback = EvalCallback(
@@ -170,7 +171,7 @@ eval_callback = EvalCallback(
     eval_freq=10000,
     deterministic=True,
     render=False,
-    verbose=0
+    verbose=1
 )
 
 from stable_baselines3.common.callbacks import BaseCallback
@@ -326,7 +327,7 @@ start_time = time.time()
 try:
     model.learn(
         total_timesteps=total_timesteps,
-        callback=[eval_callback, plateau_callback, viz_callback],  # checkpoint_callback can be added if desired
+        callback=[eval_callback, plateau_callback, viz_callback, checkpoint_callback],  # checkpoint_callback can be added if desired
         tb_log_name=run_name,
         progress_bar=True
     )

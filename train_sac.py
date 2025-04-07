@@ -14,55 +14,9 @@ import gymnasium as gym
 
 from RopeDefenseEnv import RopeEnv
 
-# Create a wrapper to convert Gym environments to Gymnasium environments
-class GymToGymnasiumWrapper(gym.Wrapper):
-    """Adapter that converts OpenAI Gym to Gymnasium environments"""
-    def __init__(self, gym_env):
-        self.gym_env = gym_env
-        
-        # Convert gym spaces to gymnasium spaces
-        obs_space = gym.spaces.Box(
-            low=gym_env.observation_space.low,
-            high=gym_env.observation_space.high,
-            shape=gym_env.observation_space.shape,
-            dtype=gym_env.observation_space.dtype
-        )
-        
-        act_space = gym.spaces.Box(
-            low=gym_env.action_space.low,
-            high=gym_env.action_space.high,
-            shape=gym_env.action_space.shape,
-            dtype=gym_env.action_space.dtype
-        )
-        
-        # Initialize with basic environment
-        env = SimpleGymnasiumEnv(obs_space, act_space)
-        super().__init__(env)
-        
-    def reset(self, **kwargs):
-        obs = self.gym_env.reset()
-        return obs, {}  # Gymnasium returns (obs, info)
-        
-    def step(self, action):
-        obs, reward, done, info = self.gym_env.step(action)
-        # Gymnasium uses (obs, reward, terminated, truncated, info)
-        return obs, reward, done, False, info
-    
-    def render(self):
-        return self.gym_env.render()
-    
-    def close(self):
-        return self.gym_env.close()
-
-class SimpleGymnasiumEnv(gym.Env):
-    """Basic environment shell for the wrapper"""
-    def __init__(self, observation_space, action_space):
-        self.observation_space = observation_space
-        self.action_space = action_space
-
 # Create directories for logs and models
 log_dir = "logs"
-model_dir = "models"
+model_dir = "models/sac"
 best_model_dir = os.path.join(model_dir, "best")
 os.makedirs(log_dir, exist_ok=True)
 os.makedirs(model_dir, exist_ok=True)
@@ -75,24 +29,24 @@ run_name = f"sac_rope_defense_{timestamp}"
 # Set up environment creation function
 def make_env(render=False):
     """Create and return a wrapped environment instance"""
-    env = RopeEnv(render_mode=render, simulation_fps=60)
-    env = GymToGymnasiumWrapper(env)  # Wrap to make compatible with Gymnasium
+    env = RopeEnv(render_mode=render)
     env = Monitor(env)
     return env
 
 # Create vectorized environment for training (no rendering)
 print("Setting up training environment...")
-env = DummyVecEnv([lambda: make_env()])
+from stable_baselines3.common.env_util import make_vec_env
+env = make_vec_env(make_env, n_envs=8, )
 env = VecNormalize(env, norm_obs=True, norm_reward=True)
 
 # Check for GPU availability
-# if torch.cuda.is_available():
-#     device = "cuda"
-#     gpu_info = torch.cuda.get_device_name(0)
-#     print(f"Training on GPU: {gpu_info}")
-# else:
-device = "cpu"
-print("No GPU detected, training on CPU")
+if torch.cuda.is_available():
+    device = "cuda"
+    gpu_info = torch.cuda.get_device_name(0)
+    print(f"Training on GPU: {gpu_info}")
+else:
+	device = "cpu"
+	print("No GPU detected, training on CPU")
 
 # Define important paths for saving/loading models and normalization statistics
 best_model_path = os.path.join(best_model_dir, "best_model")
@@ -100,52 +54,43 @@ final_model_path = os.path.join(model_dir, f"final_model_{run_name}")
 interrupt_model_path = os.path.join(model_dir, f"interrupt_model_{run_name}")
 vecnorm_path = os.path.join(model_dir, f"vecnorm_{run_name}.pkl")
 
-# Check if a best model already exists and resume training if so
-if os.path.exists(f"{best_model_path}.zip"):
-    print("Resuming training from the best checkpoint...")
-    model = SAC.load(best_model_path, env=env, device=device)
-    # Load VecNormalize stats if available
-    if os.path.exists(vecnorm_path):
-        env = VecNormalize.load(vecnorm_path, env)
-        model.set_env(env)
-    # Update metadata to record that training is resumed
-    if hasattr(model, "metadata"):
-        model.metadata.update({
-            "run_name": run_name,
-            "timestamp": timestamp,
-            "resumed": True,
-            "last_resume": datetime.now().strftime("%Y%m%d_%H%M%S")
-        })
-    else:
-        model.metadata = {
-            "run_name": run_name,
-            "timestamp": timestamp,
-            "resumed": True,
-            "last_resume": datetime.now().strftime("%Y%m%d_%H%M%S")
-        }
-else:
-    # Create a new SAC model if no best checkpoint exists
-    print("Initializing new SAC model...")
-    model = SAC(
-        "MlpPolicy",
-        env,
-        learning_rate=3e-4,
-        buffer_size=1000000,   # size of the replay buffer
-        batch_size=256,
-        tau=0.005,
-        gamma=0.99,
-        train_freq=1,          # train every step
-        gradient_steps=1,
-        verbose=1,
-        tensorboard_log=log_dir,
-        device=device,
-        policy_kwargs={"net_arch": [256, 256]}
-    )
-    model.metadata = {
-        "run_name": run_name,
-        "timestamp": timestamp,
-        "resumed": False
-    }
+from stable_baselines3.common.utils import get_schedule_fn
+
+# Define a cosine annealing learning rate schedule
+initial_learning_rate = 3e-4
+def cosine_annealing_schedule(progress_remaining):
+    return initial_learning_rate * (1 + np.cos(np.pi * progress_remaining)) / 2
+
+# Create a new SAC model if no best checkpoint exists
+print("Initializing new SAC model...")
+model = SAC(
+    "MlpPolicy",
+    env,
+    learning_rate=get_schedule_fn(cosine_annealing_schedule),  # Use the learning rate schedule
+    buffer_size=1_000_000,   # size of the replay buffer
+    batch_size=1024,
+    tau=0.01,
+    # learning_starts=2_000_000, # will actually just be retarded, since the data it collects will be garbage
+    gamma=0.99,
+    train_freq=1,          # train every step
+    gradient_steps=4,
+    use_sde=True,
+    sde_sample_freq=4,
+    target_update_interval=2,
+    verbose=1,
+    tensorboard_log=log_dir,
+    device=device,
+    # policy_kwargs={"net_arch": {"pi": [256, 256], "qf": [256, 256]}}
+    policy_kwargs = {"net_arch": {"pi": [256, 256, 256], "qf": [256, 256, 256]},
+                        "activation_fn": torch.nn.SiLU,
+                        "log_std_init": -0.5}
+    
+
+)
+model.metadata = {
+    "run_name": run_name,
+    "timestamp": timestamp,
+}
 
 # Setup evaluation environment
 eval_env = DummyVecEnv([lambda: make_env()])
@@ -158,7 +103,7 @@ checkpoint_callback = CheckpointCallback(
     save_freq=10000,
     save_path=model_dir,
     name_prefix=run_name,
-    verbose=0
+    verbose=1
 )
 
 eval_callback = EvalCallback(
@@ -168,7 +113,7 @@ eval_callback = EvalCallback(
     eval_freq=10000,
     deterministic=True,
     render=False,
-    verbose=0
+    verbose=1
 )
 
 from stable_baselines3.common.callbacks import BaseCallback
@@ -277,14 +222,15 @@ class BestModelVisualizationCallback(BaseCallback):
             best_model = SAC.load(self.best_model_path)
             
             # Run the model in the environment
-            obs = render_env.reset()
+            obs, _ = render_env.reset()
             done = False
             total_reward = 0
             step_count = 0
             
             while not done and step_count < self.preview_steps:
                 action, _ = best_model.predict(obs, deterministic=True)
-                obs, reward, done, info = render_env.step(action)
+                obs, reward, done, truncated, info = render_env.step(action)
+                done = done or truncated
                 total_reward += reward
                 step_count += 1
                 
@@ -307,7 +253,7 @@ class BestModelVisualizationCallback(BaseCallback):
 # Add the visualization callback
 viz_callback = BestModelVisualizationCallback(
     best_model_dir=best_model_dir,
-    eval_freq=100000,  # Show visualization every 100k steps
+    eval_freq=500000,  # Show visualization every 500k steps
     preview_steps=500,  # Show 500 steps in each visualization
     verbose=1
 )
@@ -319,12 +265,12 @@ print(f"Best model will be saved to: {best_model_dir}")
 print(f"Run with 'tensorboard --logdir={log_dir}' to view training metrics")
 print("Press Ctrl+C at any time to interrupt (model will be saved)")
 
-total_timesteps = 50_000_000  # Adjust as needed
+total_timesteps = 40_000_000  # Adjust as needed
 start_time = time.time()
 try:
     model.learn(
         total_timesteps=total_timesteps,
-        callback=[eval_callback, plateau_callback, viz_callback],  # checkpoint_callback can be added if desired
+        callback=[eval_callback, plateau_callback, viz_callback, checkpoint_callback],  # checkpoint_callback can be added if desired
         tb_log_name=run_name,
         progress_bar=True
     )
@@ -373,7 +319,7 @@ render_env = RopeEnv(render_mode=True, simulation_fps=60)
 trained_model = SAC.load(model_to_load)
 
 # Run the model in the environment
-obs = render_env.reset()
+obs, _ = render_env.reset()
 done = False
 total_reward = 0
 step_count = 0
@@ -383,7 +329,8 @@ try:
     while not done and step_count < max_preview_steps:
         # When using with the original env (not wrapped), need to adapt the predict call
         action, _ = trained_model.predict(obs, deterministic=True)
-        obs, reward, done, info = render_env.step(action)
+        obs, reward, done, truncated, info = render_env.step(action)
+        done = done or truncated
         total_reward += reward
         step_count += 1
         
